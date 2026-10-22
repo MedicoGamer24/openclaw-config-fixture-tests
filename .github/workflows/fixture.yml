@@ -1,0 +1,27 @@
+name: Disposable macOS config fixture
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: fixture-single-run
+  cancel-in-progress: false
+jobs:
+  fixture:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify disposable runner and test synthetic configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = macOS
+          test "$RUNNER_ARCH" = ARM64
+          /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            /usr/bin/python3 -I -S -B integration.py --disposable-runner-only
