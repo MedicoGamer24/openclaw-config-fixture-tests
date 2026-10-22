@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+import urllib.error
 
 ROOT=Path(__file__).resolve().parent
 HOME=Path('/Users/fixture-user')
@@ -29,6 +30,12 @@ CANARY='FABRICATED_FIXTURE_TOKEN_NOT_A_CREDENTIAL_7291'
 FIELD='agents.entries.main.tools.alsoAllow'
 BASE=['message']; AFTER=BASE+['gateway']
 RESULTS=[]
+STAGE='admission'
+STAGES={'admission','node_download','fixture_setup','node_extract','node_version',
+        'package_download','npm_install','package_manifest','config_tests'}
+SAFE_CODES={'RUNNER_REQUIRED','FIXTURE_TARGET_EXISTS','DOWNLOAD_INTEGRITY',
+            'PROCESS_FAILED','NPM_CONFIG_DUPLICATE','RECEIPT_ALREADY_USED',
+            'UNCERTAIN_WRITE_NO_RETRY','UNCERTAIN_POSTSTATE'}
 
 class Stop(Exception): pass
 
@@ -40,13 +47,31 @@ def environment():
     return {'HOME':str(HOME),'OPENCLAW_HOME':str(HOME),'OPENCLAW_STATE_DIR':str(STATE),
             'OPENCLAW_CONFIG_PATH':str(CONFIG),'PATH':str(NODE.parent)+':/usr/bin:/bin:/usr/sbin:/sbin',
             'TMPDIR':'/tmp','LANG':'C','LC_ALL':'C',
-            'NPM_CONFIG_USERCONFIG':'/dev/null','NPM_CONFIG_GLOBALCONFIG':'/dev/null'}
+            'NPM_CONFIG_USERCONFIG':str(HOME/'npm-user.conf'),
+            'NPM_CONFIG_GLOBALCONFIG':str(HOME/'npm-global.conf')}
+
+def failure_details(error, stage):
+    code='UNEXPECTED_ERROR'
+    if isinstance(error,Stop): code=str(error) if str(error) in SAFE_CODES else 'CHECK_FAILED'
+    elif isinstance(error,subprocess.TimeoutExpired): code='PROCESS_TIMEOUT_UNCERTAIN'
+    elif isinstance(error,urllib.error.URLError): code='DOWNLOAD_NETWORK_ERROR'
+    elif isinstance(error,OSError): code='FILESYSTEM_OR_PROCESS_ERROR'
+    return {'stage':stage if stage in STAGES else 'unknown','code':code}
+
+def create_npm_configs(home):
+    # Distinct empty synthetic files avoid npm's duplicate source rejection.
+    for name in ('npm-user.conf','npm-global.conf'):
+        fd=os.open(home/name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        os.close(fd)
 
 def run(args, check=True, timeout=120):
     p=subprocess.run([str(a) for a in args],env=environment(),cwd='/tmp',
                      stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                      timeout=timeout,check=False)
-    if check and p.returncode: raise Stop('PROCESS_FAILED')
+    if check and p.returncode:
+        if STAGE=='npm_install' and b'double-loading config' in p.stderr:
+            raise Stop('NPM_CONFIG_DUPLICATE')
+        raise Stop('PROCESS_FAILED')
     return p
 
 def download(url, destination, expected, algorithm):
@@ -75,20 +100,29 @@ def cli(expected, desired, preview=False):
     return p.returncode
 
 def bootstrap(tmp):
+    global STAGE
     if HOME.exists() or HOME.is_symlink(): raise Stop('FIXTURE_TARGET_EXISTS')
+    STAGE='node_download'
     archive=tmp/'node.tgz'
     download('https://nodejs.org/dist/v26.8.1/node-v26.8.1-darwin-arm64.tar.gz',archive,NODE_SHA,'sha256')
+    STAGE='fixture_setup'
     run(['/usr/bin/sudo','-n','mkdir',HOME])
     run(['/usr/bin/sudo','-n','chown',str(os.getuid())+':'+str(os.getgid()),HOME])
     HOME.chmod(0o700); STATE.mkdir(mode=0o700); RUNTIME.mkdir()
+    create_npm_configs(HOME)
+    STAGE='node_extract'
     run(['/usr/bin/tar','-xzf',archive,'--strip-components=1','-C',RUNTIME])
+    STAGE='node_version'
     record('exact_node',run([NODE,'--version']).stdout.strip()==b'v26.8.1')
+    STAGE='package_download'
     package=tmp/'package.tgz'
     download('https://registry.npmjs.org/openclaw/-/openclaw-2026.10.4.tgz',package,PACKAGE_SRI,'sha512')
     npm=RUNTIME/'lib/node_modules/npm/bin/npm-cli.js'
     # Explicit official lifecycle is part of installation in this disposable VM.
     # No --ignore-scripts, no --omit=optional, no lifecycle-marker/guard removal.
+    STAGE='npm_install'
     run([NODE,npm,'install','--global','--prefix',RUNTIME,'--no-audit','--no-fund',package],timeout=480)
+    STAGE='package_manifest'
     metadata=json.loads((ENTRY.parent/'package.json').read_text())
     record('exact_openclaw',metadata.get('version')=='2026.10.4')
     # Even version/help may complete pending lifecycle: no claim of zero effects.
@@ -134,6 +168,7 @@ def tests(Journal):
     record('multiprocess_journal',run(['/usr/bin/python3','-B',ROOT/'test_journal.py'],check=False).returncode==0)
 
 def main():
+    global STAGE
     if sys.argv[1:]!=['--disposable-runner-only'] or platform.system()!='Darwin' or platform.machine()!='arm64':
         raise Stop('RUNNER_REQUIRED')
     # This flag is not a sandbox; authorized execution is ONLY on a fresh hosted VM.
@@ -141,11 +176,15 @@ def main():
     spec=importlib.util.spec_from_file_location('fixture_journal',ROOT/'journal.py')
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     with tempfile.TemporaryDirectory(prefix='public-fixture-') as tmp:
-        bootstrap(Path(tmp));tests(module.Journal)
+        bootstrap(Path(tmp))
+        STAGE='config_tests'
+        tests(module.Journal)
 
 if __name__=='__main__':
-    passed=False
+    passed=False; failure=None
     try: main();passed=True
-    except Exception: RESULTS.append({'case':'stopped_without_retry','passed':False})
-    print(json.dumps({'passed':passed,'checks':RESULTS}))
+    except Exception as error:
+        failure=failure_details(error,STAGE)
+        RESULTS.append({'case':'stopped_without_retry','passed':False})
+    print(json.dumps({'passed':passed,'checks':RESULTS,'failure':failure}))
     sys.exit(0 if passed else 1)

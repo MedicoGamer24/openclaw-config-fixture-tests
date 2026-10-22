@@ -4,6 +4,8 @@ import importlib.util
 from pathlib import Path
 import re
 import unittest
+import tempfile
+import subprocess
 ROOT=Path(__file__).resolve().parent
 spec=importlib.util.spec_from_file_location('fixture_integration',ROOT/'integration.py')
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
@@ -26,7 +28,8 @@ class StaticTests(unittest.TestCase):
         env=m.environment()
         self.assertEqual(env['HOME'],'/Users/fixture-user')
         self.assertNotIn('GITHUB_TOKEN',env)
-        self.assertEqual(env['NPM_CONFIG_USERCONFIG'],'/dev/null')
+        self.assertEqual(env['NPM_CONFIG_USERCONFIG'],'/Users/fixture-user/npm-user.conf')
+        self.assertNotEqual(env['NPM_CONFIG_USERCONFIG'],env['NPM_CONFIG_GLOBALCONFIG'])
         self.assertEqual(m.fixture()['gateway']['auth']['token'],m.CANARY)
     def test_integrities_and_versions(self):
         self.assertEqual(len(m.NODE_SHA),64)
@@ -45,4 +48,22 @@ class StaticTests(unittest.TestCase):
         text=(ROOT/'integration.py').read_text()
         for x in ('mount_virtiofs','rsync','auth-profiles.json',"'--omit=optional'","'--ignore-scripts'"):
             self.assertNotIn(x,text)
+    def test_empty_separate_npm_configs(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);m.create_npm_configs(root)
+            paths=[root/'npm-user.conf',root/'npm-global.conf']
+            self.assertNotEqual(paths[0].stat().st_ino,paths[1].stat().st_ino)
+            for path in paths:
+                self.assertEqual(path.read_bytes(),b'')
+                self.assertEqual(path.stat().st_mode&0o777,0o600)
+            with self.assertRaises(FileExistsError): m.create_npm_configs(root)
+    def test_failure_projection_hides_content(self):
+        marker='FICTIONAL_PRIVATE_ERROR_CONTENT'
+        for error in (ValueError(marker),m.Stop(marker),OSError(marker),
+                      subprocess.TimeoutExpired(marker,1,output=marker,stderr=marker)):
+            result=m.failure_details(error,'npm_install')
+            self.assertNotIn(marker,str(result))
+            self.assertEqual(result['stage'],'npm_install')
+        self.assertEqual(m.failure_details(m.Stop('NPM_CONFIG_DUPLICATE'),'npm_install')['code'],'NPM_CONFIG_DUPLICATE')
+
 if __name__=='__main__': unittest.main()
