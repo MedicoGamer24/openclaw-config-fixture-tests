@@ -66,4 +66,29 @@ class StaticTests(unittest.TestCase):
             self.assertEqual(result['stage'],'npm_install')
         self.assertEqual(m.failure_details(m.Stop('NPM_CONFIG_DUPLICATE'),'npm_install')['code'],'NPM_CONFIG_DUPLICATE')
 
+    def test_preview_and_write_flags_are_separate(self):
+        preview=m.cli_arguments(m.BASE,m.AFTER,True)
+        write=m.cli_arguments(['fictional-wrong'],m.AFTER)
+        self.assertIn('--dry-run',preview);self.assertIn('--json',preview)
+        self.assertNotIn('--expect-current-json',preview)
+        self.assertIn('--expect-current-json',write);self.assertNotIn('--dry-run',write)
+        self.assertIn('--strict-json',preview);self.assertIn('--strict-json',write)
+    def test_observations_not_short_circuited(self):
+        old=m.RESULTS[:]
+        try:
+            for code,after,expected in [(1,b'original',(False,True)),(0,b'changed',(True,False))]:
+                m.RESULTS.clear()
+                with self.assertRaises(m.Stop):
+                    m.verify_config_observation('fixture',code,b'original',after,True)
+                self.assertEqual(tuple(x['passed'] for x in m.RESULTS),expected)
+        finally: m.RESULTS[:]=old
+    def test_cli_projection_drops_messages_and_values(self):
+        marker='FICTIONAL_MESSAGE_DO_NOT_PUBLISH'
+        p=subprocess.CompletedProcess([],1,stdout=(
+            '{"ok":false,"configPath":"'+marker+'","errors":[{"kind":"schema","message":"'+marker+'"}]}').encode(),stderr=b'')
+        report=m.project_cli_result(p,True)
+        self.assertEqual(report['error_kinds'],['schema'])
+        self.assertNotIn(marker,str(report))
+        self.assertEqual(report['exit_code'],1)
+
 if __name__=='__main__': unittest.main()

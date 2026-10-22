@@ -30,12 +30,13 @@ CANARY='FABRICATED_FIXTURE_TOKEN_NOT_A_CREDENTIAL_7291'
 FIELD='agents.entries.main.tools.alsoAllow'
 BASE=['message']; AFTER=BASE+['gateway']
 RESULTS=[]
+CLI_OBSERVATIONS=[]
 STAGE='admission'
 STAGES={'admission','node_download','fixture_setup','node_extract','node_version',
         'package_download','npm_install','package_manifest','config_tests'}
 SAFE_CODES={'RUNNER_REQUIRED','FIXTURE_TARGET_EXISTS','DOWNLOAD_INTEGRITY',
             'PROCESS_FAILED','NPM_CONFIG_DUPLICATE','RECEIPT_ALREADY_USED',
-            'UNCERTAIN_WRITE_NO_RETRY','UNCERTAIN_POSTSTATE'}
+            'UNCERTAIN_WRITE_NO_RETRY','UNCERTAIN_POSTSTATE','CONFIG_OBSERVATION_FAILED'}
 
 class Stop(Exception): pass
 
@@ -91,13 +92,45 @@ def reset(baseline=BASE):
 
 def field(): return json.loads(CONFIG.read_text())['agents']['entries']['main']['tools']['alsoAllow']
 
-def cli(expected, desired, preview=False):
-    args=[NODE,ENTRY,'config','set',FIELD,json.dumps(desired),'--strict-json',
-          '--expect-current-json',json.dumps(expected)]
+def cli_arguments(expected, desired, preview=False):
+    args=[NODE,ENTRY,'config','set',FIELD,json.dumps(desired),'--strict-json']
+    # Published provenance commit explicitly rejects expectations with dry-run.
     if preview: args += ['--dry-run','--json']
-    p=run(args,check=False)
+    else: args += ['--expect-current-json',json.dumps(expected)]
+    return args
+
+def project_cli_result(p, preview):
+    combined=p.stdout+p.stderr
+    report={'mode':'preview' if preview else 'write','exit_code':p.returncode,
+            'expectation_dry_run_mode_error':
+                b'conditional expectations cannot be combined with --dry-run' in combined,
+            'json_report':False,'error_kinds':[]}
+    try: data=json.loads(p.stdout)
+    except (ValueError,UnicodeDecodeError): return report
+    if not isinstance(data,dict): return report
+    report['json_report']=True
+    if type(data.get('ok')) is bool: report['ok']=data['ok']
+    allowed={'missing-path','schema','resolvability','model','conflict'}
+    errors=data.get('errors')
+    if isinstance(errors,list):
+        report['error_kinds']=sorted({e.get('kind') for e in errors
+            if isinstance(e,dict) and isinstance(e.get('kind'),str) and e['kind'] in allowed})
+    return report
+
+def cli(expected, desired, preview=False):
+    p=run(cli_arguments(expected,desired,preview),check=False)
+    CLI_OBSERVATIONS.append(project_cli_result(p,preview))
     record('captured_output_has_no_fixture_canary',CANARY.encode() not in p.stdout+p.stderr)
     return p.returncode
+
+def verify_config_observation(label, exit_code, before, after, expect_success):
+    # Record independent checks before raising; no short-circuit hides byte state.
+    exit_ok=(exit_code==0) if expect_success else (exit_code!=0)
+    unchanged=(after==before)
+    RESULTS.extend([{'case':label+'_exit','passed':exit_ok},
+                    {'case':label+'_config_unchanged','passed':unchanged}])
+    if not exit_ok or not unchanged: raise Stop('CONFIG_OBSERVATION_FAILED')
+
 
 def bootstrap(tmp):
     global STAGE
@@ -145,8 +178,10 @@ def generic_operation(journal, expected, desired, final_stage):
 def tests(Journal):
     receipts=HOME/'receipts'; receipts.mkdir(mode=0o700)
     reset(); before=CONFIG.read_bytes()
-    record('dry_run_does_not_check_precondition',cli(['fictional-wrong'],AFTER,True)==0 and CONFIG.read_bytes()==before)
-    record('write_enforces_precondition',cli(['fictional-wrong'],AFTER)!=0 and CONFIG.read_bytes()==before)
+    code=cli(BASE,AFTER,True)
+    verify_config_observation('valid_dry_run',code,before,CONFIG.read_bytes(),True)
+    code=cli(['fictional-wrong'],AFTER)
+    verify_config_observation('wrong_write_precondition',code,before,CONFIG.read_bytes(),False)
     add=Journal(receipts/'add')
     record('apply',generic_operation(add,BASE,AFTER,'applied') and field()==AFTER)
     data=json.loads(CONFIG.read_text()); data['gateway']['port']=18790
@@ -186,5 +221,5 @@ if __name__=='__main__':
     except Exception as error:
         failure=failure_details(error,STAGE)
         RESULTS.append({'case':'stopped_without_retry','passed':False})
-    print(json.dumps({'passed':passed,'checks':RESULTS,'failure':failure}))
+    print(json.dumps({'passed':passed,'checks':RESULTS,'failure':failure,'cli_observations':CLI_OBSERVATIONS}))
     sys.exit(0 if passed else 1)
